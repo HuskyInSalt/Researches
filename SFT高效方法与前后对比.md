@@ -257,6 +257,63 @@ $\Theta$ 是经验 NTK(神经切核)。即 logits 的变化可直接用核预测
 
 ---
 
+## 7+. Regime 1 深入:单步更新的三层成本阶梯
+
+> 核心论点一句话:**一次梯度步对任何输出的影响,是该输出沿「负梯度方向」的方向导数** $-\eta J_f(x')g$;方向导数有比「跑两个模型再相减」廉价得多的算法。配套可运行脚本见 `single_step_probe.py`(§B)。
+
+### 7+.1 要算的精确量
+
+在训练样本 $x$ 上走一步:$g=\nabla_\theta L(x)$,$\Delta\theta=-\eta g$。探针 $x'$ 上的输出变化:
+
+$$
+\Delta f(x') \approx J_f(x';\theta)\,\Delta\theta = -\eta\,J_f(x';\theta)\,g
+$$
+
+两个结构性事实派生出所有捷径:① $J_f\Delta\theta$ 是 **JVP**,前向模式 AD 一次前向算出,不构造 $\theta'$;② $g$ 本身是梯度,整体是「Jacobian 乘梯度」—— NTK、影响函数、TracIn 的共同对象。探针选择决定问题:$x'=x$ 问拟合速度,$x'\neq x$ 问泛化/干扰。
+
+### 7+.2 成本阶梯(按需付费)
+
+| 阶梯 | 输出粒度 | 公式 | 成本 | 理论 | FlashAttention |
+|---|---|---|---|---|---|
+| ① | 探针 loss(标量) | $\Delta L(x')\approx -\eta\langle g(x'),g(x)\rangle$ | 2×backward + 点积 | TracIn / 影响函数 | ✅ 可用 |
+| ② | 探针 logits(向量) | $\Delta z(x')\approx -\eta\,\Theta(x',x)\nabla_zL(x)$ | 1×backward + 1×JVP | 经验 NTK | ❌ 需 eager |
+| ③ | 每层 hidden | $\widehat{\Delta h_\ell}=J_{h_\ell}(x')\Delta\theta$ | 同②(一次 JVP 全拿) | 前向模式 AD | ❌ 需 eager |
+
+其中 $\Theta(x',x)=J_z(x')J_z(x)^\top$ 是经验 NTK;阶梯①只是把 logits 空间的耦合再收缩成标量:$\langle g(x'),g(x)\rangle=\nabla_zL(x')^\top\Theta(x',x)\nabla_zL(x)$。**三层是同一个量 $-\eta J_f(x')g$ 的不同读出粒度。**
+
+### 7+.3 前向模式 JVP 机制
+
+前向模式用**对偶数** $(h_\ell,\dot h_\ell)$ 逐层流动:主值正常走,切值按算子线性化同步走,切向量取 $\Delta\theta$,则**每层切值 $\dot h_\ell = J_{h_\ell}\Delta\theta$ 恰好是该层 hidden 的一阶预测变化**。一次前向跑完,所有层 $\widehat{\Delta h_\ell}$ 和 $\widehat{\Delta z}$ 全拿。资源优势:前向模式**不缓存激活**(不反传),显存远低于一次 backward,也从不物化第二份权重。
+
+### 7+.4 精度边界
+
+二阶余项 $f(\theta')=f(\theta)+J_f\Delta\theta+\tfrac12\Delta\theta^\top H_f\Delta\theta+\cdots$,误差 $=O(\eta^2\|g\|^2)$。小 $\eta$/单步 → 准(NTK / lazy 区)。**自检指标**(做一次即可):真跑更新后模型,算
+
+$$
+\rho=\frac{\|\Delta f_{\text{true}}-\Delta f_{\text{lin}}\|}{\|\Delta f_{\text{true}}\|}
+$$
+
+$\rho$ 小则放心用 JVP 批量跑探针;$\rho$ 大则已进非线性区,回 Regime 2 实跑。
+
+### 7+.5 有限差分回退 + 统一视角
+
+前向模式不支持的算子(FlashAttention 内核)用有限差分估 JVP:
+
+$$
+J_f\Delta\theta\approx\frac{f(\theta+\epsilon\Delta\theta)-f(\theta-\epsilon\Delta\theta)}{2\epsilon}
+$$
+
+只需 forward,FlashAttention 可用。**统一视角**:$\theta+1\cdot\Delta\theta$ 就是真更新后模型,故 $\epsilon\to0$=纯线性(JVP),$\epsilon=1$=真实相减,二者只差二阶余项;扫 $\epsilon$ 即可分解线性/非线性。
+
+### 7+.6 工程坑
+
+- `model.eval()` 关 dropout,否则切值无意义。
+- **JVP 必须 eager / SDPA-math**;FlashAttention 仅用于阶梯①与 FD 回退。
+- 显存峰值在拿 $g$ 那次 backward;JVP 本身省。8B 全参梯度树 bf16 ≈ 16GB,单卡 80G 可跑,小卡需限制可微参数子集。
+- 切值在 fp16 易被吃掉,关键比较用 fp32 / bf16。
+
+---
+
 ## 8. 速查总结
 
 - **loss 的数值没用,梯度/变化才有用** —— 一切「简化」的前提。

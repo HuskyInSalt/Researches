@@ -312,6 +312,32 @@ $$
 - 显存峰值在拿 $g$ 那次 backward;JVP 本身省。8B 全参梯度树 bf16 ≈ 16GB,单卡 80G 可跑,小卡需限制可微参数子集。
 - 切值在 fp16 易被吃掉,关键比较用 fp32 / bf16。
 
+### 7+.7 与 LoRA 结合:更契合,而非凑合
+
+**前提**:被分析的训练过程本身就是 LoRA SFT(此时 $\Delta\theta$ 精确地活在 adapter 子空间,不是近似)。这种组合把单步预测的两个痛点同时缓解:
+
+1. **维度/显存暴降**:可训练参数只有 $A,B$(<1%)。$g$ 从 16GB 梯度树降到几十 MB;$\Delta\theta=-\eta g$ 在冻结参数上恒为零,JVP 切向量天然稀疏(只在 LoRA 模块注入);阶梯①的内积变成 LoRA 子空间里的小内积(可视作 *LoRA-TracIn*)。
+2. **一阶近似更准**:$\Delta W=\frac{\alpha}{r}BA$ 量级小、$\alpha/r$ 缩放进一步压低单步位移,训练更靠近 lazy/NTK 区 → **观测到的 ρ 比全参更小**,JVP 预测更可信。
+
+**受限 NTK**:阶梯②的核退化为只对 LoRA 参数求 Jacobian 的低参数秩核
+
+$$
+\Theta_{\text{LoRA}}(x',x)=J_z^{\text{LoRA}}(x')\,J_z^{\text{LoRA}}(x)^\top,\qquad
+J^{\text{LoRA}}=\frac{\partial z}{\partial\{A,B\}}
+$$
+
+公式形式不变,只是把对 $\theta$ 的 Jacobian 换成对 $\{A,B\}$ 的。
+
+**实现要点**:把参数拆成「可微 adapter」+「闭包进去的冻结权重」,`grad`/`jvp` 只在前者上跑;阶梯①②③和 ρ 自检的下游代码不变(都在这个小 dict 上操作)。三个红线:
+
+- **保持 LoRA 不合并**(勿 `merge_and_unload`),否则 $A,B$ 消失无法求导;
+- **FlashAttention 仍挡 JVP**:切向量虽稀疏在参数侧,前向激活的对偶数仍穿过注意力,阶梯②③依旧需 `eager`;
+- **计算量**:JVP 仍是一次完整前向,省的是参数/梯度侧显存,不是前向 FLOPs。
+
+**两个边界**:① LoRA 初始 $B=0$ 时首步梯度集中在 $B$($\partial L/\partial A\propto B^\top=0$),解读「哪部分在动」时注意;② 仅对真实 LoRA SFT 精确,用它近似全参 SFT 有系统性偏差。
+
+> 脚本里用 `--lora` 切换到 adapter 子空间;分别带/不带 `--lora` 跑同一对样本,对比两个 ρ 即可实证「LoRA 更线性」。
+
 ---
 
 ## 8. 速查总结
@@ -320,6 +346,24 @@ $$
 - **forward 省不掉**(backward 需要激活),除非走零阶(MeZO)。
 - **三种省显存路线**:LoRA 压更新秩、GaLore 压梯度秩、MeZO 去掉梯度(连激活一起省)。
 - **前后对比**:小更新用 JVP / NTK 一次前向预测;大更新(整段 SFT)用 checkpoint 相减 + 逐层范数,别做多余 backward。
+
+---
+
+## B. 配套脚本 `single_step_probe.py`
+
+针对 HF Transformers + torch、Llama3-8B / Qwen3-8B(带 FlashAttention)的可运行实现,覆盖 §7+ 的三层阶梯:
+
+- **阶梯①** `ladder1_loss_influence`:$-\eta\langle g(x'),g(x)\rangle$,两次 backward + 点积,FlashAttention 可用。
+- **阶梯②③** `ladder23_jvp`:一次前向模式 JVP 同时拿 $\Delta\text{logits}$ 与每层 $\Delta h_\ell$;**必须 `--attn eager`**(FlashAttention 内核无前向模式规则)。
+- **ρ 自检** `rho_check`:真跑一次 $\theta'=\theta+\Delta\theta$ 比较线性预测与真实变化,$\rho<0.1$ 视为一阶可信。
+- **有限差分回退** `fd_jvp`:`--use-fd` 或 `--attn flash_attention_2` 时启用,只需 forward,FlashAttention 兼容。
+
+```bash
+python single_step_probe.py --model meta-llama/Meta-Llama-3-8B          # JVP 路径(eager)
+python single_step_probe.py --model Qwen/Qwen3-8B --attn flash_attention_2  # 自动切有限差分
+```
+
+注意:8B 全参梯度树 bf16 ≈ 16GB,JVP 主值+切值再翻倍,单卡 80G 可跑;小卡需把可微参数限制到部分层。
 
 ---
 
